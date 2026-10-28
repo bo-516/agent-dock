@@ -83,3 +83,4 @@ agent-dock/macos/build.sh
 - 菜单栏程序改完运行 `macos/build.sh`，会重新编译、安装并重启。
 - `AgentDock --render-icon <目录>` 会把菜单栏图标的四种状态导出成 PNG，方便检查。
 - `AgentDock --print-quota` 会打印读到的 Antigravity 额度后退出。
+- `AgentDock --print-conversations` 会打印读到的 Antigravity 对话（以及读取失败的原因）后退出。

@@ -173,9 +173,23 @@ final class AntigravityFeed {
         let lastActivity: Date
     }
 
+    // Why the last read failed, for `AgentDock --print-conversations`.
+    private(set) var lastError: String?
+
+    // While Antigravity is idle its database has no -wal file, and a read-only
+    // connection cannot create one, so the read fails; the main file then holds
+    // everything, and an immutable open reads it as it is, writing nothing.
     private func query() -> [Row]? {
+        if let rows = query(immutable: false) { return rows }
+        return query(immutable: true)
+    }
+
+    private func query(immutable: Bool) -> [Row]? {
         var db: OpaquePointer?
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        let file = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        let name = immutable ? "file:\(file)?immutable=1" : "file:\(file)?mode=ro"
+        guard sqlite3_open_v2(name, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+            lastError = "open: \(String(cString: sqlite3_errmsg(db)))"
             sqlite3_close(db)
             return nil
         }
@@ -195,14 +209,20 @@ final class AntigravityFeed {
             LIMIT 300
             """
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            lastError = "prepare: \(String(cString: sqlite3_errmsg(db)))"
+            return nil
+        }
         defer { sqlite3_finalize(statement) }
 
         var rows: [Row] = []
         while true {
             let step = sqlite3_step(statement)
             if step == SQLITE_DONE { break }
-            guard step == SQLITE_ROW else { return nil }
+            guard step == SQLITE_ROW else {
+                lastError = "step: \(String(cString: sqlite3_errmsg(db)))"
+                return nil
+            }
             let id = text(statement, 0)
             let title = text(statement, 1)
             let (key, name) = projectName(forPath: firstWorkspacePath(text(statement, 2)))
@@ -215,6 +235,7 @@ final class AntigravityFeed {
                 lastActivity: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, 4)))
             ))
         }
+        lastError = nil
         return rows
     }
 

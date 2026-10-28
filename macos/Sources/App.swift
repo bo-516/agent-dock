@@ -218,6 +218,16 @@ enum AgentDockApp {
             MenuIcon.render(to: args[flag + 1])
             return
         }
+        // Prints Antigravity's conversations as the dock reads them.
+        if args.contains("--print-conversations") {
+            let feed = AntigravityFeed()
+            let conversations = feed.read()
+            print("\(conversations.count) conversations" + (feed.lastError.map { ", last error: \($0)" } ?? ""))
+            for c in conversations.prefix(8) {
+                print("\(c.state)\t\(c.project)\t\(ago(c.lastActivity, now: Date()))\t\(c.title)")
+            }
+            return
+        }
         // Prints Antigravity's limits as the dock reads them, for checking it outside the menu bar.
         if args.contains("--print-quota") {
             let quota = AntigravityQuota()
