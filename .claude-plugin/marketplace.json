@@ -1,0 +1,6 @@
+{
+  "name": "agent-dock",
+  "description": "Agent Dock: Claude Code sessions in a pane and, with Antigravity's conversations, in a macOS menu bar dropdown",
+  "owner": { "name": "bo-516" },
+  "plugins": [{ "name": "agent-dock", "source": "./claude-plugin" }]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "agent-dock",
+  "version": "0.1.0",
+  "description": "A pane listing Claude Code sessions by project, with running and unread ones marked, that also feeds the Agent Dock menu bar app",
+  "author": { "name": "bo-516" },
+  "homepage": "https://github.com/bo-516/agent-dock",
+  "repository": "https://github.com/bo-516/agent-dock",
+  "types": "./types/index.d.ts"
+}
