@@ -430,7 +430,6 @@ export const register: Register = on => {
       group.rows.push(s)
       groups.set(key, group)
     }
-    const running = list.filter(s => s.isRunning)
 
     const toggle = (key: string) =>
       update($, expanded, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key]))
@@ -480,14 +479,6 @@ export const register: Register = on => {
             读取会话失败：{problem}
           </Text>
         )}
-
-        <Box flexDirection="column" rowGap="xs">
-          <Text size="heading" weight="semibold">
-            正在运行 {running.length > 0 ? `(${running.length})` : ''}
-          </Text>
-          {running.length === 0 && <Text dimColor>没有正在运行的会话</Text>}
-          {running.map(s => row(s, projectOf(s.cwd).name, 'running'))}
-        </Box>
 
         {list.length === 0 && <Text dimColor>{span.empty}</Text>}
 
