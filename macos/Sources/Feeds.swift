@@ -511,13 +511,13 @@ func parseDate(_ text: String) -> Date? {
     isoFractional.date(from: text) ?? isoPlain.date(from: text)
 }
 
-// "35m ago", "1h 20m ago" (or "3h ago" on the hour), "2d ago" from a day on.
+// "35m ago", then whole hours ("2h ago"), then days ("2d ago").
 func ago(_ date: Date, now: Date) -> String {
     let minutes = Int(now.timeIntervalSince(date) / 60)
     if minutes < 1 { return "just now" }
     if minutes < 60 { return "\(minutes)m ago" }
     let hours = minutes / 60
-    if hours < 24 { return minutes % 60 == 0 ? "\(hours)h ago" : "\(hours)h \(minutes % 60)m ago" }
+    if hours < 24 { return "\(hours)h ago" }
     return "\(hours / 24)d ago"
 }
 

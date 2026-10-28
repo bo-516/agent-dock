@@ -109,10 +109,12 @@ async function onScreen($: EngineInterface) {
 
 // The shared state every session's pane and the menu bar app (macos/ in this repository) read.
 // One session at a time writes it: the one named `writer`, or any session
-// once the writer has gone quiet. Unread marks live in the file, so they
-// survive a change of writer.
+// once the writer has gone quiet or runs older code. Unread marks live in
+// the file, so they survive a change of writer.
 type Exported = {
   writer: string
+  // WRITER_VERSION of the code that wrote it; absent before versions.
+  version?: number
   updatedAt: string
   sessions: Array<{
     id: string
@@ -128,6 +130,9 @@ type Exported = {
 
 // A writer that has not written for this long is taken over.
 const STALE_MS = 3 * REFRESH_MS
+// Raise it whenever what gets written changes: a session still running older
+// code (one nobody reloaded) then hands the writing to one with this code.
+const WRITER_VERSION = 2
 
 async function boardFile($: EngineInterface, name: string) {
   const home = await $.env.get('HOME')
@@ -177,7 +182,11 @@ async function refresh($: EngineInterface) {
     const me = await $.session.id()
     const now = await $.clock.now()
     const last = path ? await readExported($, path) : undefined
-    const isWriter = !last || last.writer === me || now - Date.parse(last.updatedAt) > STALE_MS
+    const isWriter =
+      !last ||
+      last.writer === me ||
+      now - Date.parse(last.updatedAt) > STALE_MS ||
+      (last.version ?? 1) < WRITER_VERSION
 
     let rows: SessionRow[]
     let marked: string[]
@@ -223,6 +232,7 @@ async function writeExported(
 ) {
   const data: Exported = {
     writer,
+    version: WRITER_VERSION,
     updatedAt: new Date(now).toISOString(),
     // Every session: each pane and the menu bar app apply their own range.
     sessions: rows.map(s => ({
@@ -276,13 +286,13 @@ function projectOf(cwd: string) {
   return { key: cwd, name: name || 'No Project' }
 }
 
-// "35m ago", "1h 20m ago" (or "3h ago" on the hour), "2d ago" from a day on.
+// "35m ago", then whole hours ("2h ago"), then days ("2d ago").
 function ago(iso: string, now: number) {
   const minutes = Math.floor((now - Date.parse(iso)) / 60000)
   if (!Number.isFinite(minutes) || minutes < 1) return 'just now'
   if (minutes < 60) return `${minutes}m ago`
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return minutes % 60 === 0 ? `${hours}h ago` : `${hours}h ${minutes % 60}m ago`
+  if (hours < 24) return `${hours}h ago`
 
   return `${Math.floor(hours / 24)}d ago`
 }

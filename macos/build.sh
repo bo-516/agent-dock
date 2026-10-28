@@ -14,7 +14,8 @@ swiftc -O -swift-version 5 -parse-as-library -target "$ARCH-apple-macos13.0" \
   Sources/*.swift -o "$APP/Contents/MacOS/AgentDock"
 codesign --force --sign - "$APP"
 
-pkill -f "AgentDock.app/Contents/MacOS/AgentDock" || true
+# By process name: a pattern over whole command lines also hits shells that mention the path.
+pkill -x AgentDock || true
 # Opening it again straight after the kill fails with -600.
 sleep 1
 mkdir -p "$HOME/Applications"
