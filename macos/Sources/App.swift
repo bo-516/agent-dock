@@ -218,6 +218,19 @@ enum AgentDockApp {
             MenuIcon.render(to: args[flag + 1])
             return
         }
+        // Prints Antigravity's limits as the dock reads them, for checking it outside the menu bar.
+        if args.contains("--print-quota") {
+            let quota = AntigravityQuota()
+            quota.fetch { rows in
+                guard let rows else {
+                    print("Antigravity did not answer (is it running?)")
+                    exit(1)
+                }
+                for row in rows { print("\(row.label)\t\(row.percentUsed)% used\tresets \(row.resetsAt)") }
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         app.delegate = delegate

@@ -155,7 +155,13 @@ struct ClaudeColumn: View {
                 open: { model.openApp(ClaudeFeed.bundleIDs[0]) }
             )
             if !model.usage.isEmpty {
-                UsageSection(model: model)
+                UsageSection(
+                    rows: model.usage.map {
+                        UsageRow(id: $0.kind, label: usageLabel($0.kind), percentUsed: $0.percentUsed, resetsAt: $0.resetsAt)
+                    },
+                    updatedAt: model.usageAt,
+                    now: model.now
+                )
                 Divider().padding(.horizontal, edge)
             }
             SessionList(model: model, sessions: model.visible(model.claude, within: range.seconds),
@@ -173,6 +179,10 @@ struct AntigravityColumn: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ColumnHeader(title: "Antigravity", note: nil, open: { model.openApp(AntigravityFeed.bundleIDs[0]) })
+            if !model.antigravityUsage.isEmpty {
+                UsageSection(rows: model.antigravityUsage, updatedAt: model.antigravityUsageAt, now: model.now)
+                Divider().padding(.horizontal, edge)
+            }
             SessionList(model: model, sessions: model.visible(model.antigravity, within: range.seconds),
                         range: range, expanded: $expanded)
         }
@@ -228,30 +238,34 @@ struct SessionList: View {
 
 // MARK: - Usage
 
+// A source's plan limits: one bar per limit, used share and time to reset.
 struct UsageSection: View {
-    @ObservedObject var model: BoardModel
+    let rows: [UsageRow]
+    // When the figures were read: Claude's at its last API response, Antigravity's when asked.
+    let updatedAt: Date?
+    let now: Date
 
-    // The figures are as of the last API response any Claude session got.
     private var readingAge: String {
-        guard let at = model.usageAt else { return "" }
-        return model.now.timeIntervalSince(at) < 300 ? "updated just now" : "updated \(ago(at, now: model.now))"
+        guard let updatedAt else { return "" }
+        return now.timeIntervalSince(updatedAt) < 300 ? "updated just now" : "updated \(ago(updatedAt, now: now))"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             SectionTitle(text: "套餐用量", trailing: readingAge)
-            ForEach(model.usage) { window in
-                let reset = until(window.resetsAt, now: model.now)
+            ForEach(rows) { row in
+                let reset = until(row.resetsAt, now: now)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline) {
-                        Text(usageLabel(window.kind)).font(.system(size: 13))
-                        Spacer()
-                        Text(reset.map { "\(format(window.percentUsed)) · \($0)" } ?? "已重置")
+                        Text(row.label).font(.system(size: 13)).lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(reset.map { "\(format(row.percentUsed)) · \($0)" } ?? "已重置")
                             .font(.system(size: 12))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
-                    UsageBar(fraction: reset == nil ? 0 : window.percentUsed / 100)
+                    UsageBar(fraction: reset == nil ? 0 : row.percentUsed / 100)
                 }
                 .padding(.horizontal, edge)
                 .padding(.vertical, 6)

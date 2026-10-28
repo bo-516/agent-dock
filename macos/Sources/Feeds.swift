@@ -46,6 +46,14 @@ struct UsageWindow: Decodable, Equatable, Identifiable {
     var id: String { kind }
 }
 
+// One limit as a column shows it: what it is, how much is used, when it resets.
+struct UsageRow: Identifiable, Equatable {
+    let id: String
+    let label: String
+    let percentUsed: Double
+    let resetsAt: String
+}
+
 let home = FileManager.default.homeDirectoryForCurrentUser
 
 func projectName(forPath path: String) -> (key: String, name: String) {
@@ -174,11 +182,15 @@ final class AntigravityFeed {
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 300)
 
+        // Top-level conversations someone has written in, leaving out ones another
+        // agent started (subagents, sidekicks) and side questions (/btw).
         let sql = """
             SELECT conversation_id, title, workspace_uris, status,
                    CAST(strftime('%s', last_modified_time) AS INTEGER)
             FROM conversation_summaries
-            WHERE nesting_depth = 0 AND (title <> '' OR step_count > 0)
+            WHERE nesting_depth = 0 AND parent_conversation_id = '' AND agent_name = ''
+              AND step_count > 0
+              AND lower(title) NOT LIKE 'btw%' AND lower(ltrim(preview)) NOT LIKE '/btw%'
             ORDER BY last_modified_time DESC
             LIMIT 300
             """
@@ -220,6 +232,148 @@ final class AntigravityFeed {
     }
 }
 
+// Antigravity's plan limits (5-hour and weekly, per model group), from the
+// quota summary its Agent Manager shows. Its language server answers on a
+// local port and wants the token it was started with; both are read from the
+// running process each time and kept nowhere. Internal and undocumented: a
+// new Antigravity may change it.
+final class AntigravityQuota: NSObject, URLSessionDelegate {
+    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+    private let queue = DispatchQueue(label: "agent-dock.antigravity-quota")
+
+    // Calls back on the main queue: the rows, or nil when Antigravity did not answer.
+    func fetch(_ done: @escaping ([UsageRow]?) -> Void) {
+        queue.async {
+            guard let server = Self.findServer() else {
+                DispatchQueue.main.async { done(nil) }
+                return
+            }
+            self.request(ports: server.ports, token: server.token, done: done)
+        }
+    }
+
+    private func request(ports: [String], token: String, done: @escaping ([UsageRow]?) -> Void) {
+        guard let port = ports.first,
+              let url = URL(string: "https://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary")
+        else {
+            DispatchQueue.main.async { done(nil) }
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.setValue(token, forHTTPHeaderField: "x-codeium-csrf-token")
+        request.httpBody = Data("{}".utf8)
+        session.dataTask(with: request) { data, response, _ in
+            guard (response as? HTTPURLResponse)?.statusCode == 200, let data, let rows = Self.rows(from: data) else {
+                self.request(ports: Array(ports.dropFirst()), token: token, done: done)
+                return
+            }
+            DispatchQueue.main.async { done(rows) }
+        }.resume()
+    }
+
+    // The language server is local and signs its own certificate.
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let space = challenge.protectionSpace
+        if space.authenticationMethod == NSURLAuthenticationMethodServerTrust, space.host == "127.0.0.1",
+           let trust = space.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+
+    private struct Summary: Decodable {
+        let response: Response?
+
+        struct Response: Decodable {
+            let groups: [Group]?
+        }
+
+        struct Group: Decodable {
+            let displayName: String?
+            let buckets: [Bucket]?
+        }
+
+        struct Bucket: Decodable {
+            let bucketId: String?
+            let window: String?
+            let remainingFraction: Double?
+            let resetTime: String?
+        }
+    }
+
+    private static func rows(from data: Data) -> [UsageRow]? {
+        guard let summary = try? JSONDecoder().decode(Summary.self, from: data),
+              let groups = summary.response?.groups else { return nil }
+        let order = ["5h": 0, "daily": 1, "weekly": 2]
+        return groups.flatMap { group -> [UsageRow] in
+            let name = shortName(group.displayName ?? "")
+            return (group.buckets ?? [])
+                .filter { $0.remainingFraction != nil }
+                .sorted { order[$0.window ?? "", default: 9] < order[$1.window ?? "", default: 9] }
+                .map { bucket in
+                    let used = (1 - (bucket.remainingFraction ?? 1)) * 100
+                    return UsageRow(id: bucket.bucketId ?? "\(name)-\(bucket.window ?? "")",
+                                    label: "\(name) · \(windowLabel(bucket.window ?? ""))",
+                                    percentUsed: (used * 10).rounded() / 10,
+                                    resetsAt: bucket.resetTime ?? "")
+                }
+        }
+    }
+
+    // "Gemini Models" → "Gemini", "Claude and GPT models" → "Claude / GPT".
+    private static func shortName(_ name: String) -> String {
+        name.replacingOccurrences(of: " models", with: "", options: [.caseInsensitive, .anchored, .backwards])
+            .replacingOccurrences(of: " and ", with: " / ")
+    }
+
+    private static func windowLabel(_ window: String) -> String {
+        switch window {
+        case "5h": return "5 小时"
+        case "daily": return "每天"
+        case "weekly": return "每周"
+        default: return window
+        }
+    }
+
+    // The Antigravity language server's token (from its arguments) and the ports it listens on.
+    private static func findServer() -> (token: String, ports: [String])? {
+        guard let processes = run("/bin/ps", ["-axo", "pid=,command="]) else { return nil }
+        for line in processes.split(separator: "\n") {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard text.contains("Antigravity"), text.contains("/bin/language_server "),
+                  let flag = text.range(of: "--csrf_token ") else { continue }
+            let token = String(text[flag.upperBound...].prefix { $0 != " " })
+            let pid = String(text.prefix { $0 != " " })
+            guard !token.isEmpty,
+                  let listening = run("/usr/sbin/lsof", ["-nP", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN", "-Fn"])
+            else { continue }
+            let ports = listening.split(separator: "\n")
+                .filter { $0.hasPrefix("n") }
+                .compactMap { $0.split(separator: ":").last.map(String.init) }
+            if !ports.isEmpty { return (token, ports) }
+        }
+        return nil
+    }
+
+    private static func run(_ path: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 // MARK: - Board
 
 final class BoardModel: ObservableObject {
@@ -227,6 +381,8 @@ final class BoardModel: ObservableObject {
     @Published var antigravity: [Session] = []
     @Published var usage: [UsageWindow] = []
     @Published var usageAt: Date?
+    @Published var antigravityUsage: [UsageRow] = []
+    @Published var antigravityUsageAt: Date?
     @Published var claudeUpdatedAt: Date?
     @Published var now = Date()
     @Published var showClaude: Bool {
@@ -240,6 +396,8 @@ final class BoardModel: ObservableObject {
     var isShown = false
     let animator = IconAnimator()
     private let antigravityFeed = AntigravityFeed()
+    private let antigravityQuota = AntigravityQuota()
+    private var quotaAskedAt = Date.distantPast
     private var timer: Timer?
 
     init() {
@@ -264,7 +422,23 @@ final class BoardModel: ObservableObject {
         }
         let conversations = antigravityFeed.read()
         if conversations != antigravity { antigravity = conversations }
+        refreshQuota(every: isShown ? 15 : 60)
         animator.setSpinning(runningCount > 0)
+    }
+
+    // Asks Antigravity for its limits at most every `seconds`, while it runs and its column shows.
+    private func refreshQuota(every seconds: TimeInterval) {
+        guard showAntigravity, Date().timeIntervalSince(quotaAskedAt) >= seconds else { return }
+        let isRunning = NSWorkspace.shared.runningApplications.contains {
+            AntigravityFeed.bundleIDs.contains($0.bundleIdentifier ?? "")
+        }
+        guard isRunning else { return }
+        quotaAskedAt = Date()
+        antigravityQuota.fetch { [weak self] rows in
+            guard let self, let rows else { return }
+            if rows != self.antigravityUsage { self.antigravityUsage = rows }
+            self.antigravityUsageAt = Date()
+        }
     }
 
     // The plugin stops writing when no Claude Code session is running it.

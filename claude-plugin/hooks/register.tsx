@@ -65,6 +65,19 @@ type Listed = {
   isRunning?: boolean
   lastActivityAt?: string
   link?: string
+  // Set on a session another session started: a /btw question, a fork, a task card.
+  startedBy?: string
+  parentSessionId?: string
+}
+
+// Left out of the pane and the dock: side questions (/btw), sessions another
+// session started, and sessions nobody has written in yet (still untitled).
+function isCounted(one: Listed) {
+  if (one.startedBy || one.parentSessionId) return false
+  const title = (one.title ?? '').trim()
+  if (/^btw\b/i.test(title)) return false
+
+  return title !== '' && !/^(untitled|new)( session| chat)?$/i.test(title)
 }
 
 async function callText($: EngineInterface, server: string, tool: string, args: Record<string, unknown>) {
@@ -153,7 +166,7 @@ async function listSessions($: EngineInterface) {
   }
 
   return listed
-    .filter(one => one.sessionId)
+    .filter(one => one.sessionId && isCounted(one))
     .map(toRow)
     .sort((a, b) => Date.parse(b.lastActivityAt || '0') - Date.parse(a.lastActivityAt || '0'))
 }
