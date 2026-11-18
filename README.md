@@ -1,11 +1,11 @@
 # Agent Dock
 
-一眼看清 Claude Code 和 Antigravity 里哪些任务正在跑、哪些跑完了还没看。
+一眼看清 Claude Code、Codex 和 Antigravity 里哪些任务正在跑、哪些跑完了还没看。
 
 它由两部分组成：
 
 - **Claude Code 插件**（`claude-plugin/`）：在 Claude 桌面端每个会话旁边加一个「会话」面板，按项目列出所有 Claude Code 会话；同时把会话状态和套餐用量写到 `~/.claude/agent-dock/`，供菜单栏程序读取。
-- **macOS 菜单栏程序 AgentDock**（`macos/`）：点顶部菜单栏图标弹出下拉面板，左栏 Claude、右栏 Antigravity，点会话即可跳过去。
+- **macOS 菜单栏程序 AgentDock**（`macos/`）：点顶部菜单栏图标弹出下拉面板，依次并排展示 Claude、Codex、Antigravity 三栏，点会话即可跳过去。
 
 ## 功能
 
@@ -13,17 +13,17 @@
 - 状态一眼可见：橙色转圈是运行中，蓝点是停下后还没看过，灰色是已看过
 - 时间范围切换：`6h` · `24h` · `7d` · `all`，默认 6h
 - 菜单栏图标随状态变化：右上角转圈表示有任务在跑，旁边的数字是运行中的数量；实心点表示有未查看的
-- 两栏都显示套餐用量（5 小时、每周）和精确到分钟的重置时间；Antigravity 按模型组分开（Gemini、Claude / GPT）
-- 下拉面板顶部可以单独隐藏 Claude 或 Antigravity 一栏，选择会被记住
-- 登录时自动启动；只在 Claude 或 Antigravity 运行时才出现在菜单栏
+- 三栏都显示套餐用量（5 小时、每周等）和精确到分钟的重置时间；Antigravity 按模型组分开（Gemini、Claude / GPT）
+- 下拉面板顶部可以单独隐藏 Claude、Codex 或 Antigravity 任意一栏，选择会被记住
+- 登录时自动启动；只在 Claude、Codex（桌面端或 CLI 会话）或 Antigravity 运行时才出现在菜单栏
 
 ### 不计入的会话
 
-两边都不显示、也不计数：
+三边都不显示、也不计数：
 
 - `/btw` 的旁支问询（桌面端和 CLI 都算）
-- 由其他会话派生出来的会话（Claude 的 fork、任务卡片启动的会话；Antigravity 的子 Agent、sidekick）
-- 还没发过消息的新会话
+- 由其他会话派生出来的会话（Claude 的 fork、任务卡片启动的会话；Codex 的 subagent、guardian review、非交互 `codex exec`；Antigravity 的子 Agent、sidekick）
+- 还没发过消息的新会话（以及 Codex 中已归档的会话）
 
 ## 安装
 
@@ -66,14 +66,17 @@ agent-dock/macos/build.sh
 
 - 每个 Claude 会话都会加载插件，但同一时间只有一个会话负责通过 Claude 桌面端的会话接口读取列表，写入 `~/.claude/agent-dock/state.json`；它停止后，其他会话在约 12 秒内接手。「未查看」由插件根据当前窗口里显示的会话判断。
 - 套餐用量由拿到最新读数的会话写入 `~/.claude/agent-dock/usage.json`，数据来自 Claude Code 最近一次 API 响应。
+- Codex 的本地会话、项目和已读回执从 `~/.codex/state_*.sqlite` 只读读取；运行状态通过 `~/.codex/thread-writer-locks/*.lock` 的进程文件锁结合 `~/.codex/thread_history_*.sqlite` 的最新 turn 状态判断，点击会话通过 `codex://threads/<id>` 直接打开对应会话。Codex 那边不需要安装任何东西。
+- Codex 的套餐额度通过内置或本机安装的 `codex app-server` 标准 JSON-RPC 接口（`account/rateLimits/read`）按需查询。
 - Antigravity 的对话从它本地的 `~/.gemini/antigravity/conversation_summaries.db` 只读读取，Antigravity 那边不需要安装任何东西。
 - Antigravity 的额度来自它本地语言服务的额度接口（Agent Manager 自己显示额度用的也是它）。AgentDock 每次请求前从该进程的启动参数里读取访问令牌和监听端口，令牌只在内存里使用，不写入任何地方。
 
 ## 已知限制
 
 - Antigravity 没有能直接打开某条对话的链接，点 Antigravity 的会话只会打开它的 Agent Manager。
-- Antigravity 不告诉外部你正在看哪条对话，所以它的「未查看」只在从下拉面板点开、或对话重新开始运行时清除；对话停下时如果 Antigravity 在最前面，就不算未查看。
-- Antigravity 的数据库格式和额度接口都没有公开文档，Antigravity 升级后可能需要跟着调整。
+- Antigravity 不告诉外部你正在看哪条对话，所以它的「未查看」只在从下拉面板点开、或对话重新开始运行时清除；对话停下时如果 Antigravity 在最前面，就不算未查看。（Codex 桌面端会话使用其自带的 `thread_read_receipts` 同步已读状态；无回执的 CLI 会话采用同样的前台判断兜底。）
+- Codex 的云端沙盒会话若未落地到本地 `~/.codex/state_*.sqlite`，不会出现在列表里。
+- Codex 和 Antigravity 的本地数据库格式没有公开稳定性承诺，客户端大版本升级后可能需要跟着调整。
 - Claude 的「还没发消息」是按标题判断的（空标题或默认标题），没有消息数可查。
 - 菜单栏的 Claude 数据依赖至少一个开着的 Claude 会话加载了插件；否则 Claude 栏会显示「未连接」。
 
@@ -82,5 +85,5 @@ agent-dock/macos/build.sh
 - 插件从仓库目录直接读取，改完在会话里运行 `/reload-plugins` 即可生效。
 - 菜单栏程序改完运行 `macos/build.sh`，会重新编译、安装并重启。
 - `AgentDock --render-icon <目录>` 会把菜单栏图标的四种状态导出成 PNG，方便检查。
-- `AgentDock --print-quota` 会打印读到的 Antigravity 额度后退出。
-- `AgentDock --print-conversations` 会打印读到的 Antigravity 对话（以及读取失败的原因）后退出。
+- `AgentDock --print-quota` 会打印读到的 Codex 与 Antigravity 额度后退出。
+- `AgentDock --print-conversations` 会打印读到的 Codex 与 Antigravity 对话（以及读取失败的原因）后退出。

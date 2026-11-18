@@ -1,5 +1,5 @@
 // The dropdown: a top bar with the source switches and the time range, then
-// one column per shown source (Claude, Antigravity), then the app's own rows.
+// one column per shown source (Claude, Codex, Antigravity), then the app's own rows.
 
 import ServiceManagement
 import SwiftUI
@@ -47,14 +47,20 @@ struct BoardView: View {
                 if model.showClaude {
                     ClaudeColumn(model: model, range: range, expanded: $expanded)
                 }
-                if model.showClaude && model.showAntigravity {
+                if model.showClaude && (model.showCodex || model.showAntigravity) {
+                    Divider()
+                }
+                if model.showCodex {
+                    CodexColumn(model: model, range: range, expanded: $expanded)
+                }
+                if model.showCodex && model.showAntigravity {
                     Divider()
                 }
                 if model.showAntigravity {
                     AntigravityColumn(model: model, range: range, expanded: $expanded)
                 }
-                if !model.showClaude && !model.showAntigravity {
-                    Text("Claude 和 Antigravity 都隐藏了，点上面的按钮显示")
+                if visibleColumns == 0 {
+                    Text("Claude、Codex 和 Antigravity 都隐藏了，点上面的按钮显示")
                         .font(.system(size: 13))
                         .foregroundStyle(.secondary)
                         .padding(edge)
@@ -74,10 +80,14 @@ struct BoardView: View {
         .frame(width: width)
     }
 
-    // One column per shown source and the line between them; one column's worth with none.
+    private var visibleColumns: Int {
+        (model.showClaude ? 1 : 0) + (model.showCodex ? 1 : 0) + (model.showAntigravity ? 1 : 0)
+    }
+
+    // One column per shown source and the lines between them; one column's worth with none.
     private var width: CGFloat {
-        let columns = (model.showClaude ? 1 : 0) + (model.showAntigravity ? 1 : 0)
-        return columns == 2 ? columnWidth * 2 + 1 : columnWidth
+        guard visibleColumns > 0 else { return columnWidth }
+        return columnWidth * CGFloat(visibleColumns) + CGFloat(visibleColumns - 1)
     }
 }
 
@@ -94,6 +104,7 @@ struct TopBar: View {
                 }
                 Spacer(minLength: 12)
                 SourceToggle(name: "Claude", isOn: $model.showClaude)
+                SourceToggle(name: "Codex", isOn: $model.showCodex)
                 SourceToggle(name: "Antigravity", isOn: $model.showAntigravity)
             }
             HStack {
@@ -165,6 +176,25 @@ struct ClaudeColumn: View {
                 Divider().padding(.horizontal, edge)
             }
             SessionList(model: model, sessions: model.visible(model.claude, within: range.seconds),
+                        range: range, expanded: $expanded)
+        }
+        .frame(width: columnWidth)
+    }
+}
+
+struct CodexColumn: View {
+    @ObservedObject var model: BoardModel
+    let range: TimeRange
+    @Binding var expanded: Set<String>
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ColumnHeader(title: "Codex", note: nil, open: { model.openApp(CodexFeed.bundleIDs[0]) })
+            if !model.codexUsage.isEmpty {
+                UsageSection(rows: model.codexUsage, updatedAt: model.codexUsageAt, now: model.now)
+                Divider().padding(.horizontal, edge)
+            }
+            SessionList(model: model, sessions: model.visible(model.codex, within: range.seconds),
                         range: range, expanded: $expanded)
         }
         .frame(width: columnWidth)
