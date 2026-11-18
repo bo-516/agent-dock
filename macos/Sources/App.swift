@@ -1,6 +1,6 @@
-// Agent Dock: a menu bar item that drops down the Claude Code sessions and the
-// Antigravity conversations, each in a column, by project. It starts at login
-// and shows its item while Claude or Antigravity is running.
+// Agent Dock: a menu bar item that drops down Claude Code, Codex, and
+// Antigravity sessions, each in a column, by project. It starts at login
+// and shows its item while Claude, Codex, or Antigravity is running.
 
 import AppKit
 import Combine
@@ -84,6 +84,7 @@ final class DropdownPanel: NSPanel {
 final class StatusController: NSObject, NSWindowDelegate {
     private let model: BoardModel
     private let claude = AppWatcher(bundleIDs: ClaudeFeed.bundleIDs)
+    private let codex = AppWatcher(bundleIDs: CodexFeed.bundleIDs)
     private let antigravity = AppWatcher(bundleIDs: AntigravityFeed.bundleIDs)
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let dropdown = DropdownState()
@@ -115,9 +116,9 @@ final class StatusController: NSObject, NSWindowDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] in self?.redrawIcon() }
             .store(in: &bag)
-        // The app runs from login on; its item comes and goes with Claude and Antigravity.
-        claude.$isRunning.combineLatest(antigravity.$isRunning)
-            .map { $0 || $1 }
+        // The app runs from login on; its item comes and goes with Claude, Codex, and Antigravity.
+        Publishers.CombineLatest4(claude.$isRunning, codex.$isRunning, antigravity.$isRunning, model.$hasActiveCodexSession)
+            .map { $0 || $1 || $2 || $3 }
             .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] isAnyRunning in
@@ -218,26 +219,56 @@ enum AgentDockApp {
             MenuIcon.render(to: args[flag + 1])
             return
         }
-        // Prints Antigravity's conversations as the dock reads them.
+        // Prints Codex and Antigravity conversations as the dock reads them.
         if args.contains("--print-conversations") {
+            let codexFeed = CodexFeed()
+            let codexThreads = codexFeed.read()
+            print("[Codex] \(codexThreads.count) threads" + (codexFeed.lastError.map { ", last error: \($0)" } ?? ""))
+            for c in codexThreads.prefix(8) {
+                print("  \(c.state)\t\(c.project)\t\(ago(c.lastActivity, now: Date()))\t\(c.title)")
+            }
             let feed = AntigravityFeed()
             let conversations = feed.read()
-            print("\(conversations.count) conversations" + (feed.lastError.map { ", last error: \($0)" } ?? ""))
+            print("[Antigravity] \(conversations.count) conversations" + (feed.lastError.map { ", last error: \($0)" } ?? ""))
             for c in conversations.prefix(8) {
-                print("\(c.state)\t\(c.project)\t\(ago(c.lastActivity, now: Date()))\t\(c.title)")
+                print("  \(c.state)\t\(c.project)\t\(ago(c.lastActivity, now: Date()))\t\(c.title)")
             }
             return
         }
-        // Prints Antigravity's limits as the dock reads them, for checking it outside the menu bar.
+        // Prints Codex and Antigravity limits as the dock reads them, for checking outside the menu bar.
         if args.contains("--print-quota") {
+            let group = DispatchGroup()
+            var codexRows: [UsageRow]?
+            var antigravityRows: [UsageRow]?
+
+            group.enter()
+            let codexQuota = CodexQuota()
+            codexQuota.fetch { rows in
+                codexRows = rows
+                group.leave()
+            }
+
+            group.enter()
             let quota = AntigravityQuota()
             quota.fetch { rows in
-                guard let rows else {
-                    print("Antigravity did not answer (is it running?)")
-                    exit(1)
+                antigravityRows = rows
+                group.leave()
+            }
+
+            group.notify(queue: .main) {
+                print("[Codex]")
+                if let codexRows, !codexRows.isEmpty {
+                    for row in codexRows { print("  \(row.label)\t\(row.percentUsed)% used\tresets \(row.resetsAt)") }
+                } else {
+                    print("  Codex did not answer (is codex CLI / ChatGPT.app installed and signed in?)")
                 }
-                for row in rows { print("\(row.label)\t\(row.percentUsed)% used\tresets \(row.resetsAt)") }
-                exit(0)
+                print("[Antigravity]")
+                if let antigravityRows, !antigravityRows.isEmpty {
+                    for row in antigravityRows { print("  \(row.label)\t\(row.percentUsed)% used\tresets \(row.resetsAt)") }
+                } else {
+                    print("  Antigravity did not answer (is it running?)")
+                }
+                exit(codexRows == nil && antigravityRows == nil ? 1 : 0)
             }
             RunLoop.main.run()
         }

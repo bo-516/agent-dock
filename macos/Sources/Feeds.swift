@@ -1,13 +1,16 @@
-// Where the dock's sessions come from: Claude Code sessions, from the file the
-// agent-dock plugin keeps, and Antigravity conversations, from Antigravity's
-// own summary database. Both are read on a timer into one BoardModel.
+// Where the dock's sessions come from: Claude Code sessions (from the file the
+// agent-dock plugin keeps), Codex threads (from ~/.codex SQLite databases and
+// locks), and Antigravity conversations (from Antigravity's summary database).
+// All three are read on a timer into one BoardModel.
 
 import AppKit
 import Combine
+import Darwin
 import SQLite3
 
 enum Source: String {
     case claude
+    case codex
     case antigravity
 }
 
@@ -25,7 +28,7 @@ struct Session: Identifiable, Equatable {
     let projectKey: String
     let state: RunState
     let lastActivity: Date
-    // A claude:// link for Claude; unused for Antigravity, which has no link to a conversation.
+    // A claude:// or codex:// link; unused for Antigravity, which has no link to a conversation.
     let link: String
 
     var isRunning: Bool { state == .running }
@@ -395,19 +398,570 @@ final class AntigravityQuota: NSObject, URLSessionDelegate {
     }
 }
 
+// MARK: - Codex
+
+// Codex (both the ChatGPT/Codex desktop app and the `codex` CLI) stores local
+// threads, projects, and read receipts in ~/.codex/state_<N>.sqlite, turn
+// statuses in ~/.codex/thread_history_<N>.sqlite, and holds an exclusive flock
+// on ~/.codex/thread-writer-locks/<id>.lock while a live process has a thread
+// loaded. Everything here opens read-only and never touches auth files.
+final class CodexFeed {
+    static let bundleIDs = ["com.openai.codex"]
+    private static let unreadKey = "codexUnread"
+    private static let dismissedTurnsKey = "codexDismissedTurns"
+    private static let seededKey = "codexReceiptsSeeded"
+    private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    static var folder: URL {
+        if let custom = ProcessInfo.processInfo.environment["CODEX_HOME"], !custom.isEmpty {
+            return URL(fileURLWithPath: custom)
+        }
+        return home.appendingPathComponent(".codex")
+    }
+
+    private var wasRunning: Set<String>?
+    private var unread: Set<String>
+    private var dismissedTurns: [String: String]
+    private var latestUnreadTurns: [String: String] = [:]
+    private var last: [Session] = []
+
+    // True while any live Codex process holds a thread writer lock (including CLI sessions).
+    private(set) var hasActiveSessionLock = false
+    private(set) var lastError: String?
+
+    init() {
+        unread = Set(UserDefaults.standard.stringArray(forKey: Self.unreadKey) ?? [])
+        dismissedTurns = UserDefaults.standard.dictionary(forKey: Self.dismissedTurnsKey) as? [String: String] ?? [:]
+    }
+
+    func read() -> [Session] {
+        let locked = lockedThreadIDs()
+        hasActiveSessionLock = !locked.isEmpty
+
+        guard let rows = query(locked: locked) else { return last }
+        let running = Set(rows.filter(\.isRunning).map(\.id))
+        if let wasRunning {
+            let isInFront = Self.bundleIDs.contains(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+            let stopped = wasRunning.subtracting(running)
+            if !isInFront { unread.formUnion(stopped) }
+        }
+        wasRunning = running
+        unread.subtract(running)
+        unread.formIntersection(Set(rows.map(\.id)))
+
+        var currentUnreadTurns: [String: String] = [:]
+        for row in rows where row.hasReceipt && !row.firstUnreadTurn.isEmpty && !row.isRunning {
+            currentUnreadTurns[row.id] = row.firstUnreadTurn
+        }
+        latestUnreadTurns = currentUnreadTurns
+        if !UserDefaults.standard.bool(forKey: Self.seededKey) {
+            for (id, turn) in currentUnreadTurns { dismissedTurns[id] = turn }
+            UserDefaults.standard.set(true, forKey: Self.seededKey)
+        }
+        dismissedTurns = dismissedTurns.filter { id, turn in
+            !running.contains(id) && currentUnreadTurns[id] == turn
+        }
+
+        UserDefaults.standard.set(Array(unread), forKey: Self.unreadKey)
+        UserDefaults.standard.set(dismissedTurns, forKey: Self.dismissedTurnsKey)
+
+        last = rows.map { row in
+            let isUnread: Bool
+            if row.isRunning {
+                isUnread = false
+            } else if row.hasReceipt {
+                isUnread = !row.firstUnreadTurn.isEmpty && dismissedTurns[row.id] != row.firstUnreadTurn
+            } else {
+                isUnread = unread.contains(row.id)
+            }
+            return Session(
+                id: row.id,
+                source: .codex,
+                title: row.title,
+                project: row.project,
+                projectKey: row.projectKey,
+                state: row.isRunning ? .running : isUnread ? .unread : .seen,
+                lastActivity: row.lastActivity,
+                link: "codex://threads/\(row.id)"
+            )
+        }
+        return last
+    }
+
+    func markSeen(_ id: String) {
+        unread.remove(id)
+        if let turn = latestUnreadTurns[id], !turn.isEmpty {
+            dismissedTurns[id] = turn
+        }
+        UserDefaults.standard.set(Array(unread), forKey: Self.unreadKey)
+        UserDefaults.standard.set(dismissedTurns, forKey: Self.dismissedTurnsKey)
+    }
+
+    private struct Row {
+        let id: String
+        let title: String
+        let project: String
+        let projectKey: String
+        let isRunning: Bool
+        let hasReceipt: Bool
+        let firstUnreadTurn: String
+        let lastActivity: Date
+    }
+
+    private func query(locked: Set<String>) -> [Row]? {
+        guard let statePath = Self.latestSQLite(prefix: "state_") else {
+            lastError = nil
+            return []
+        }
+        if let rows = queryState(at: statePath, locked: locked, immutable: false) { return rows }
+        return queryState(at: statePath, locked: locked, immutable: true)
+    }
+
+    private func queryState(at path: String, locked: Set<String>, immutable: Bool) -> [Row]? {
+        guard let db = Self.openReadOnly(path: path, immutable: immutable, errorOut: &lastError) else { return nil }
+        defer { sqlite3_close(db) }
+
+        let hasProjects = Self.tableExists(db, "projects")
+        let hasReceipts = Self.tableExists(db, "thread_read_receipts")
+        let hasSpawnEdges = Self.tableExists(db, "thread_spawn_edges")
+
+        let projectSelect = hasProjects ? "COALESCE(p.name, '')" : "''"
+        let projectJoin = hasProjects ? "LEFT JOIN projects p ON p.id = t.project_id" : ""
+        let receiptSelect = hasReceipts
+            ? "CASE WHEN r.thread_id IS NOT NULL THEN 1 ELSE 0 END, COALESCE(r.first_unread_turn, '')"
+            : "0, ''"
+        let receiptJoin = hasReceipts ? "LEFT JOIN thread_read_receipts r ON r.thread_id = t.id" : ""
+        let spawnFilter = hasSpawnEdges ? "AND t.id NOT IN (SELECT child_thread_id FROM thread_spawn_edges)" : ""
+
+        let sql = """
+            SELECT t.id, COALESCE(t.name, ''), t.title, t.preview, t.cwd,
+                   \(projectSelect),
+                   COALESCE(NULLIF(t.recency_at_ms, 0), t.updated_at * 1000),
+                   \(receiptSelect),
+                   t.rollout_path
+            FROM threads t
+            \(projectJoin)
+            \(receiptJoin)
+            WHERE t.archived = 0
+              AND trim(t.preview) <> ''
+              AND (t.thread_source IS NULL OR t.thread_source = '' OR t.thread_source = 'user')
+              AND t.source NOT LIKE '{"subagent"%'
+              AND t.source <> 'exec'
+              AND (t.agent_role IS NULL OR t.agent_role = '')
+              AND (t.attached_thread_parent_id IS NULL OR t.attached_thread_parent_id = '')
+              \(spawnFilter)
+              AND lower(COALESCE(t.name, '')) NOT LIKE 'btw%'
+              AND lower(t.title) NOT LIKE 'btw%'
+              AND lower(ltrim(t.preview)) NOT LIKE '/btw%'
+            ORDER BY COALESCE(NULLIF(t.recency_at_ms, 0), t.updated_at * 1000) DESC
+            LIMIT 300
+            """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            lastError = "prepare: \(String(cString: sqlite3_errmsg(db)))"
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var rawRows: [(id: String, name: String, title: String, preview: String, cwd: String,
+                       projectName: String, activityMs: Int64, hasReceipt: Bool,
+                       firstUnread: String, rolloutPath: String)] = []
+        var rolloutByID: [String: String] = [:]
+
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else {
+                lastError = "step: \(String(cString: sqlite3_errmsg(db)))"
+                return nil
+            }
+            let id = Self.text(statement, 0)
+            let rolloutPath = Self.text(statement, 9)
+            if locked.contains(id), !rolloutPath.isEmpty { rolloutByID[id] = rolloutPath }
+            rawRows.append((
+                id: id,
+                name: Self.text(statement, 1),
+                title: Self.text(statement, 2),
+                preview: Self.text(statement, 3),
+                cwd: Self.text(statement, 4),
+                projectName: Self.text(statement, 5),
+                activityMs: sqlite3_column_int64(statement, 6),
+                hasReceipt: sqlite3_column_int(statement, 7) != 0,
+                firstUnread: Self.text(statement, 8),
+                rolloutPath: rolloutPath
+            ))
+        }
+
+        let activeIDs = runningThreadIDs(locked: locked, rolloutByID: rolloutByID)
+        let rows = rawRows.map { item -> Row in
+            let (projectKey, project) = Self.codexProject(cwd: item.cwd, explicitName: item.projectName)
+            return Row(
+                id: item.id,
+                title: Self.cleanTitle(name: item.name, title: item.title, preview: item.preview),
+                project: project,
+                projectKey: projectKey,
+                isRunning: activeIDs.contains(item.id),
+                hasReceipt: item.hasReceipt,
+                firstUnreadTurn: item.firstUnread,
+                lastActivity: Date(timeIntervalSince1970: TimeInterval(item.activityMs) / 1000.0)
+            )
+        }
+        lastError = nil
+        return rows
+    }
+
+    // Threads whose writer lock file is currently held by a live Codex process.
+    private func lockedThreadIDs() -> Set<String> {
+        let dir = Self.folder.appendingPathComponent("thread-writer-locks")
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
+        var ids: Set<String> = []
+        for name in names where !name.hasPrefix(".") && name.hasSuffix(".lock") {
+            let path = dir.appendingPathComponent(name).path
+            let fd = Darwin.open(path, O_RDONLY)
+            guard fd >= 0 else { continue }
+            defer { Darwin.close(fd) }
+            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                if errno == EWOULDBLOCK || errno == EAGAIN {
+                    ids.insert(String(name.dropLast(5)))
+                }
+            } else {
+                _ = flock(fd, LOCK_UN)
+            }
+        }
+        return ids
+    }
+
+    // A locked thread is loaded in memory; it is actively running only when its
+    // latest turn in thread_history_<N>.sqlite is `inProgress` (or, before
+    // paginated history catches up, its rollout file ends on `task_started`).
+    private func runningThreadIDs(locked: Set<String>, rolloutByID: [String: String]) -> Set<String> {
+        guard !locked.isEmpty else { return [] }
+        var running: Set<String> = []
+        var checkedInHistory: Set<String> = []
+
+        if let historyPath = Self.latestSQLite(prefix: "thread_history_"),
+           let db = Self.openReadOnly(path: historyPath, immutable: false, errorOut: nil)
+                ?? Self.openReadOnly(path: historyPath, immutable: true, errorOut: nil) {
+            defer { sqlite3_close(db) }
+            let sql = "SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1"
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                defer { sqlite3_finalize(statement) }
+                for id in locked {
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                    sqlite3_bind_text(statement, 1, id, -1, Self.transient)
+                    if sqlite3_step(statement) == SQLITE_ROW {
+                        checkedInHistory.insert(id)
+                        if Self.text(statement, 0) == "inProgress" {
+                            running.insert(id)
+                        }
+                    }
+                }
+            }
+        }
+
+        for id in locked where !checkedInHistory.contains(id) {
+            if let path = rolloutByID[id], Self.isRolloutRunning(at: path) {
+                running.insert(id)
+            }
+        }
+        return running
+    }
+
+    private static func isRolloutRunning(at path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        let end = (try? handle.seekToEnd()) ?? 0
+        let tailOffset = end > 65_536 ? end - 65_536 : 0
+        try? handle.seek(toOffset: tailOffset)
+        guard let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) else { return false }
+        let started = text.range(of: "\"type\":\"task_started\"", options: .backwards)?.lowerBound
+        let completed = text.range(of: "\"type\":\"task_complete\"", options: .backwards)?.lowerBound
+        let aborted = text.range(of: "\"type\":\"turn_aborted\"", options: .backwards)?.lowerBound
+        guard let started else { return false }
+        if let completed, completed > started { return false }
+        if let aborted, aborted > started { return false }
+        return true
+    }
+
+    private static func latestSQLite(prefix: String) -> String? {
+        let dir = folder
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return nil }
+        var best: (version: Int, name: String)?
+        for entry in entries where entry.hasPrefix(prefix) && entry.hasSuffix(".sqlite") {
+            let numberPart = entry.dropFirst(prefix.count).dropLast(".sqlite".count)
+            let version = Int(numberPart) ?? 0
+            if best == nil || version > best!.version {
+                best = (version, entry)
+            }
+        }
+        return best.map { dir.appendingPathComponent($0.name).path }
+    }
+
+    private static func openReadOnly(path: String, immutable: Bool, errorOut: inout String?) -> OpaquePointer? {
+        var db: OpaquePointer?
+        let file = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        let uri = immutable ? "file:\(file)?immutable=1" : "file:\(file)?mode=ro"
+        guard sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+            errorOut = "open: \(String(cString: sqlite3_errmsg(db)))"
+            sqlite3_close(db)
+            return nil
+        }
+        sqlite3_busy_timeout(db, 300)
+        return db
+    }
+
+    private static func openReadOnly(path: String, immutable: Bool, errorOut: UnsafeMutablePointer<String?>?) -> OpaquePointer? {
+        var ignored: String?
+        let db = openReadOnly(path: path, immutable: immutable, errorOut: &ignored)
+        errorOut?.pointee = ignored
+        return db
+    }
+
+    private static func tableExists(_ db: OpaquePointer?, _ name: String) -> Bool {
+        var statement: OpaquePointer?
+        let sql = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, name, -1, transient)
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    private static func text(_ statement: OpaquePointer?, _ column: Int32) -> String {
+        guard let value = sqlite3_column_text(statement, column) else { return "" }
+        return String(cString: value)
+    }
+
+    // Codex Desktop puts projectless chats in ~/Documents/Codex/YYYY-MM-DD/<slug>.
+    private static func codexProject(cwd: String, explicitName: String) -> (key: String, name: String) {
+        let scratchRoot = home.appendingPathComponent("Documents/Codex").path
+        if cwd.isEmpty || cwd.contains("/scratch-workspaces/")
+            || cwd == scratchRoot || cwd.hasPrefix(scratchRoot + "/") {
+            return ("", "No Project")
+        }
+        let trimmed = explicitName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = trimmed.isEmpty ? URL(fileURLWithPath: cwd).lastPathComponent : trimmed
+        return (cwd, name.isEmpty ? "No Project" : name)
+    }
+
+    private static func cleanTitle(name: String, title: String, preview: String) -> String {
+        let short = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !short.isEmpty, let first = short.split(whereSeparator: \.isNewline).first {
+            return String(first)
+        }
+        var raw = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty { raw = preview.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if let marker = raw.range(of: "## My request:") {
+            raw = String(raw[marker.upperBound...])
+        }
+        let line = raw.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty } ?? ""
+        let unescaped = line.replacingOccurrences(of: "\\.", with: ".")
+            .replacingOccurrences(of: "\\&", with: "&")
+            .replacingOccurrences(of: "\\_", with: "_")
+        return unescaped.isEmpty ? "Untitled conversation" : unescaped
+    }
+}
+
+// Codex's plan limits, read via the official `codex app-server` JSON-RPC
+// `account/rateLimits/read` request on the bundled or user-installed `codex` CLI.
+final class CodexQuota {
+    private let queue = DispatchQueue(label: "agent-dock.codex-quota")
+
+    func fetch(_ done: @escaping ([UsageRow]?) -> Void) {
+        queue.async {
+            let rows = Self.fetchViaAppServer()
+            DispatchQueue.main.async { done(rows) }
+        }
+    }
+
+    private struct RPCEnvelope: Decodable {
+        let id: Int?
+        let result: ResultPayload?
+
+        struct ResultPayload: Decodable {
+            let rateLimits: Snapshot?
+            let rateLimitsByLimitId: [String: Snapshot]?
+        }
+
+        struct Snapshot: Decodable {
+            let limitId: String?
+            let limitName: String?
+            let primary: Window?
+            let secondary: Window?
+        }
+
+        struct Window: Decodable {
+            let usedPercent: Double?
+            let windowDurationMins: Int?
+            let resetsAt: Int64?
+        }
+    }
+
+    private static func fetchViaAppServer() -> [UsageRow]? {
+        guard let executable = findExecutable() else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["app-server"]
+        let inPipe = Pipe()
+        let outPipe = Pipe()
+        process.standardInput = inPipe
+        process.standardOutput = outPipe
+        process.standardError = FileHandle.nullDevice
+
+        do { try process.run() } catch { return nil }
+
+        let timeout = DispatchWorkItem {
+            if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 8, execute: timeout)
+        defer {
+            timeout.cancel()
+            try? inPipe.fileHandleForWriting.close()
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+        }
+
+        let initLine = #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"agent-dock","title":"Agent Dock","version":"1.0"},"capabilities":{"experimentalApi":true}}}"# + "\n"
+        guard (try? inPipe.fileHandleForWriting.write(contentsOf: Data(initLine.utf8))) != nil else { return nil }
+
+        var buffer = Data()
+        var sentQuery = false
+        let reader = outPipe.fileHandleForReading
+
+        while true {
+            let chunk = reader.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer[..<newline]
+                buffer.removeSubrange(...newline)
+                guard !lineData.isEmpty,
+                      let message = try? JSONDecoder().decode(RPCEnvelope.self, from: Data(lineData)),
+                      let id = message.id else { continue }
+                if id == 1 && !sentQuery {
+                    sentQuery = true
+                    let nextLines = #"{"jsonrpc":"2.0","method":"initialized"}"# + "\n"
+                        + #"{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read","params":{}}"# + "\n"
+                    try? inPipe.fileHandleForWriting.write(contentsOf: Data(nextLines.utf8))
+                } else if id == 2 {
+                    return rows(from: message.result)
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func rows(from payload: RPCEnvelope.ResultPayload?) -> [UsageRow]? {
+        guard let payload else { return nil }
+        let buckets: [(key: String, snapshot: RPCEnvelope.Snapshot)]
+        if let map = payload.rateLimitsByLimitId, !map.isEmpty {
+            buckets = map.sorted { lhs, rhs in
+                if lhs.key == "codex" { return true }
+                if rhs.key == "codex" { return false }
+                return lhs.key < rhs.key
+            }.map { ($0.key, $0.value) }
+        } else if let single = payload.rateLimits {
+            buckets = [(single.limitId ?? "codex", single)]
+        } else {
+            return nil
+        }
+
+        var result: [UsageRow] = []
+        for (key, snapshot) in buckets {
+            let name = (snapshot.limitName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let prefix = (key == "codex" && name.isEmpty) ? nil : (name.isEmpty ? key : name)
+            let windows = [("primary", snapshot.primary), ("secondary", snapshot.secondary)]
+                .compactMap { slot, win -> (String, RPCEnvelope.Window)? in win.map { (slot, $0) } }
+                .sorted { ($0.1.windowDurationMins ?? .max) < ($1.1.windowDurationMins ?? .max) }
+            for (slot, window) in windows {
+                guard let used = window.usedPercent else { continue }
+                let resetText = window.resetsAt.map {
+                    isoPlain.string(from: Date(timeIntervalSince1970: TimeInterval($0)))
+                } ?? ""
+                let windowName = windowLabel(minutes: window.windowDurationMins, hasPrefix: prefix != nil)
+                let label = prefix.map { "\($0) · \(windowName)" } ?? windowName
+                result.append(UsageRow(
+                    id: "\(key)-\(slot)",
+                    label: label,
+                    percentUsed: (used * 10).rounded() / 10,
+                    resetsAt: resetText
+                ))
+            }
+        }
+        return result
+    }
+
+    private static func windowLabel(minutes: Int?, hasPrefix: Bool) -> String {
+        let suffix = hasPrefix ? "" : "额度"
+        switch minutes {
+        case 300: return "5 小时\(suffix)"
+        case 1440: return "每天\(suffix)"
+        case 10080: return "每周\(suffix)"
+        case let m? where m > 0 && m % 1440 == 0: return "\(m / 1440) 天\(suffix)"
+        case let m? where m > 0 && m % 60 == 0: return "\(m / 60) 小时\(suffix)"
+        case let m? where m > 0: return "\(m) 分钟\(suffix)"
+        default: return hasPrefix ? "用量" : "套餐额度"
+        }
+    }
+
+    private static func findExecutable() -> String? {
+        let fm = FileManager.default
+        var candidates: [String] = []
+        for id in CodexFeed.bundleIDs {
+            if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+                candidates.append(app.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex").path)
+                candidates.append(app.appendingPathComponent("Contents/Resources/codex-cli/bin/codex").path)
+            }
+        }
+        candidates.append(contentsOf: [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+            "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            home.appendingPathComponent(".local/bin/codex").path,
+            home.appendingPathComponent(".cargo/bin/codex").path,
+        ])
+        if let hit = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) { return hit }
+        for extDir in [".vscode/extensions", ".cursor/extensions", ".antigravity-ide/extensions"] {
+            let root = home.appendingPathComponent(extDir)
+            guard let items = try? fm.contentsOfDirectory(atPath: root.path) else { continue }
+            for item in items.sorted().reversed() where item.hasPrefix("openai.chatgpt-") {
+                let binRoot = root.appendingPathComponent(item).appendingPathComponent("bin")
+                guard let platforms = try? fm.contentsOfDirectory(atPath: binRoot.path) else { continue }
+                for platform in platforms {
+                    let bin = binRoot.appendingPathComponent(platform).appendingPathComponent("codex").path
+                    if fm.isExecutableFile(atPath: bin) { return bin }
+                }
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - Board
 
 final class BoardModel: ObservableObject {
     @Published var claude: [Session] = []
+    @Published var codex: [Session] = []
     @Published var antigravity: [Session] = []
     @Published var usage: [UsageWindow] = []
     @Published var usageAt: Date?
+    @Published var codexUsage: [UsageRow] = []
+    @Published var codexUsageAt: Date?
     @Published var antigravityUsage: [UsageRow] = []
     @Published var antigravityUsageAt: Date?
     @Published var claudeUpdatedAt: Date?
+    @Published var hasActiveCodexSession = false
     @Published var now = Date()
     @Published var showClaude: Bool {
         didSet { UserDefaults.standard.set(showClaude, forKey: "showClaude") }
+    }
+    @Published var showCodex: Bool {
+        didSet { UserDefaults.standard.set(showCodex, forKey: "showCodex") }
     }
     @Published var showAntigravity: Bool {
         didSet { UserDefaults.standard.set(showAntigravity, forKey: "showAntigravity") }
@@ -416,14 +970,18 @@ final class BoardModel: ObservableObject {
     // Set by the dropdown; the clock behind "35m ago" only ticks while it shows.
     var isShown = false
     let animator = IconAnimator()
+    private let codexFeed = CodexFeed()
+    private let codexQuota = CodexQuota()
     private let antigravityFeed = AntigravityFeed()
     private let antigravityQuota = AntigravityQuota()
+    private var codexQuotaAskedAt = Date.distantPast
     private var quotaAskedAt = Date.distantPast
     private var timer: Timer?
 
     init() {
         let defaults = UserDefaults.standard
         showClaude = defaults.object(forKey: "showClaude") as? Bool ?? true
+        showCodex = defaults.object(forKey: "showCodex") as? Bool ?? true
         showAntigravity = defaults.object(forKey: "showAntigravity") as? Bool ?? true
         load()
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.load() }
@@ -441,10 +999,31 @@ final class BoardModel: ObservableObject {
             if list.sessions != claude { claude = list.sessions }
             if list.updatedAt != claudeUpdatedAt { claudeUpdatedAt = list.updatedAt }
         }
+        let threads = codexFeed.read()
+        if threads != codex { codex = threads }
+        if codexFeed.hasActiveSessionLock != hasActiveCodexSession {
+            hasActiveCodexSession = codexFeed.hasActiveSessionLock
+        }
         let conversations = antigravityFeed.read()
         if conversations != antigravity { antigravity = conversations }
-        refreshQuota(every: isShown ? 15 : 60)
+        let interval: TimeInterval = isShown ? 15 : 60
+        refreshCodexQuota(every: interval)
+        refreshQuota(every: interval)
         animator.setSpinning(runningCount > 0)
+    }
+
+    private func refreshCodexQuota(every seconds: TimeInterval) {
+        guard showCodex, Date().timeIntervalSince(codexQuotaAskedAt) >= seconds else { return }
+        let isRunning = hasActiveCodexSession || NSWorkspace.shared.runningApplications.contains {
+            CodexFeed.bundleIDs.contains($0.bundleIdentifier ?? "")
+        }
+        guard isRunning else { return }
+        codexQuotaAskedAt = Date()
+        codexQuota.fetch { [weak self] rows in
+            guard let self, let rows else { return }
+            if rows != self.codexUsage { self.codexUsage = rows }
+            self.codexUsageAt = Date()
+        }
     }
 
     // Asks Antigravity for its limits at most every `seconds`, while it runs and its column shows.
@@ -470,7 +1049,7 @@ final class BoardModel: ObservableObject {
 
     // What the menu bar item counts: the columns that are shown.
     private var shown: [Session] {
-        (showClaude ? claude : []) + (showAntigravity ? antigravity : [])
+        (showClaude ? claude : []) + (showCodex ? codex : []) + (showAntigravity ? antigravity : [])
     }
 
     var runningCount: Int { shown.filter(\.isRunning).count }
@@ -503,6 +1082,15 @@ final class BoardModel: ObservableObject {
         case .claude:
             guard session.link.hasPrefix("claude://"), let url = URL(string: session.link) else { return }
             NSWorkspace.shared.open(url)
+        case .codex:
+            codexFeed.markSeen(session.id)
+            codex = codexFeed.read()
+            if session.link.hasPrefix("codex://"), let url = URL(string: session.link),
+               NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+                NSWorkspace.shared.open(url)
+            } else {
+                openApp(CodexFeed.bundleIDs[0])
+            }
         case .antigravity:
             // No link reaches one conversation; this brings up the Agent Manager.
             antigravityFeed.markSeen(session.id)
