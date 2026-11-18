@@ -409,7 +409,10 @@ final class CodexFeed {
     static let bundleIDs = ["com.openai.codex"]
     private static let unreadKey = "codexUnread"
     private static let dismissedTurnsKey = "codexDismissedTurns"
-    private static let seededKey = "codexReceiptsSeeded"
+    // When AgentDock first read Codex: read receipts older than this are history,
+    // not something that just finished. A date rather than a flag, so two
+    // processes starting together cannot leave it half done.
+    private static let receiptsSinceKey = "codexReceiptsSince"
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     static var folder: URL {
@@ -422,6 +425,7 @@ final class CodexFeed {
     private var wasRunning: Set<String>?
     private var unread: Set<String>
     private var dismissedTurns: [String: String]
+    private let receiptsSince: Date
     private var latestUnreadTurns: [String: String] = [:]
     private var last: [Session] = []
 
@@ -432,6 +436,13 @@ final class CodexFeed {
     init() {
         unread = Set(UserDefaults.standard.stringArray(forKey: Self.unreadKey) ?? [])
         dismissedTurns = UserDefaults.standard.dictionary(forKey: Self.dismissedTurnsKey) as? [String: String] ?? [:]
+        if let since = UserDefaults.standard.object(forKey: Self.receiptsSinceKey) as? Date {
+            receiptsSince = since
+        } else {
+            receiptsSince = Date()
+            UserDefaults.standard.set(receiptsSince, forKey: Self.receiptsSinceKey)
+        }
+        UserDefaults.standard.removeObject(forKey: "codexReceiptsSeeded")
     }
 
     func read() -> [Session] {
@@ -454,10 +465,6 @@ final class CodexFeed {
             currentUnreadTurns[row.id] = row.firstUnreadTurn
         }
         latestUnreadTurns = currentUnreadTurns
-        if !UserDefaults.standard.bool(forKey: Self.seededKey) {
-            for (id, turn) in currentUnreadTurns { dismissedTurns[id] = turn }
-            UserDefaults.standard.set(true, forKey: Self.seededKey)
-        }
         dismissedTurns = dismissedTurns.filter { id, turn in
             !running.contains(id) && currentUnreadTurns[id] == turn
         }
@@ -470,7 +477,8 @@ final class CodexFeed {
             if row.isRunning {
                 isUnread = false
             } else if row.hasReceipt {
-                isUnread = !row.firstUnreadTurn.isEmpty && dismissedTurns[row.id] != row.firstUnreadTurn
+                isUnread = !row.firstUnreadTurn.isEmpty && row.lastActivity > receiptsSince
+                    && dismissedTurns[row.id] != row.firstUnreadTurn
             } else {
                 isUnread = unread.contains(row.id)
             }
@@ -639,24 +647,16 @@ final class CodexFeed {
         var running: Set<String> = []
         var checkedInHistory: Set<String> = []
 
-        if let historyPath = Self.latestSQLite(prefix: "thread_history_"),
-           let db = Self.openReadOnly(path: historyPath, immutable: false, errorOut: nil)
-                ?? Self.openReadOnly(path: historyPath, immutable: true, errorOut: nil) {
-            defer { sqlite3_close(db) }
-            let sql = "SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1"
-            var statement: OpaquePointer?
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                defer { sqlite3_finalize(statement) }
-                for id in locked {
-                    sqlite3_reset(statement)
-                    sqlite3_clear_bindings(statement)
-                    sqlite3_bind_text(statement, 1, id, -1, Self.transient)
-                    if sqlite3_step(statement) == SQLITE_ROW {
+        if let historyPath = Self.latestSQLite(prefix: "thread_history_") {
+            // A WAL database with no -wal file opens read-only but fails on the
+            // first read; the immutable open then reads the main file as it is.
+            for immutable in [false, true] {
+                if let statuses = Self.latestTurnStatuses(at: historyPath, threads: locked, immutable: immutable) {
+                    for (id, status) in statuses {
                         checkedInHistory.insert(id)
-                        if Self.text(statement, 0) == "inProgress" {
-                            running.insert(id)
-                        }
+                        if status == "inProgress" { running.insert(id) }
                     }
+                    break
                 }
             }
         }
@@ -667,6 +667,30 @@ final class CodexFeed {
             }
         }
         return running
+    }
+
+    // Each thread's latest turn status, or nil when the database could not be read.
+    private static func latestTurnStatuses(at path: String, threads: Set<String>, immutable: Bool) -> [String: String]? {
+        var error: String?
+        guard let db = openReadOnly(path: path, immutable: immutable, errorOut: &error) else { return nil }
+        defer { sqlite3_close(db) }
+        let sql = "SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        var statuses: [String: String] = [:]
+        for id in threads {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, id, -1, transient)
+            let step = sqlite3_step(statement)
+            if step == SQLITE_ROW {
+                statuses[id] = text(statement, 0)
+            } else if step != SQLITE_DONE {
+                return nil
+            }
+        }
+        return statuses
     }
 
     private static func isRolloutRunning(at path: String) -> Bool {
@@ -685,7 +709,8 @@ final class CodexFeed {
         return true
     }
 
-    private static func latestSQLite(prefix: String) -> String? {
+    // The newest generation of a Codex database, e.g. state_5.sqlite over state_4.sqlite.
+    static func latestSQLite(prefix: String) -> String? {
         let dir = folder
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return nil }
         var best: (version: Int, name: String)?
@@ -699,7 +724,7 @@ final class CodexFeed {
         return best.map { dir.appendingPathComponent($0.name).path }
     }
 
-    private static func openReadOnly(path: String, immutable: Bool, errorOut: inout String?) -> OpaquePointer? {
+    static func openReadOnly(path: String, immutable: Bool, errorOut: inout String?) -> OpaquePointer? {
         var db: OpaquePointer?
         let file = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
         let uri = immutable ? "file:\(file)?immutable=1" : "file:\(file)?mode=ro"
@@ -712,13 +737,6 @@ final class CodexFeed {
         return db
     }
 
-    private static func openReadOnly(path: String, immutable: Bool, errorOut: UnsafeMutablePointer<String?>?) -> OpaquePointer? {
-        var ignored: String?
-        let db = openReadOnly(path: path, immutable: immutable, errorOut: &ignored)
-        errorOut?.pointee = ignored
-        return db
-    }
-
     private static func tableExists(_ db: OpaquePointer?, _ name: String) -> Bool {
         var statement: OpaquePointer?
         let sql = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
@@ -728,7 +746,7 @@ final class CodexFeed {
         return sqlite3_step(statement) == SQLITE_ROW
     }
 
-    private static func text(_ statement: OpaquePointer?, _ column: Int32) -> String {
+    static func text(_ statement: OpaquePointer?, _ column: Int32) -> String {
         guard let value = sqlite3_column_text(statement, column) else { return "" }
         return String(cString: value)
     }
@@ -966,6 +984,15 @@ final class BoardModel: ObservableObject {
     @Published var showAntigravity: Bool {
         didSet { UserDefaults.standard.set(showAntigravity, forKey: "showAntigravity") }
     }
+    // Pinned: the dropdown stays up when another app comes forward or a row opens
+    // something, and can be dragged anywhere.
+    @Published var isPinned: Bool {
+        didSet { UserDefaults.standard.set(isPinned, forKey: "isPinned") }
+    }
+
+    // Set by the status controller: the pointer entered (true) or left (false) a
+    // session row, with the row's frame in the dropdown's top-left coordinates.
+    var onHoverSession: ((Session, Bool, CGRect) -> Void)?
 
     // Set by the dropdown; the clock behind "35m ago" only ticks while it shows.
     var isShown = false
@@ -983,6 +1010,7 @@ final class BoardModel: ObservableObject {
         showClaude = defaults.object(forKey: "showClaude") as? Bool ?? true
         showCodex = defaults.object(forKey: "showCodex") as? Bool ?? true
         showAntigravity = defaults.object(forKey: "showAntigravity") as? Bool ?? true
+        isPinned = defaults.bool(forKey: "isPinned")
         load()
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.load() }
         RunLoop.main.add(timer, forMode: .common)
@@ -1076,8 +1104,17 @@ final class BoardModel: ObservableObject {
         return order.map { ProjectGroup(id: $0, name: names[$0] ?? $0, rows: rows[$0] ?? []) }
     }
 
+    func hoverSession(_ session: Session, inside: Bool, frame: CGRect) {
+        onHoverSession?(session, inside, frame)
+    }
+
+    // A row opened something: the dropdown gets out of the way unless it is pinned.
+    private func dismissUnlessPinned() {
+        if !isPinned { NotificationCenter.default.post(name: .closeDropdown, object: nil) }
+    }
+
     func open(_ session: Session) {
-        NotificationCenter.default.post(name: .closeDropdown, object: nil)
+        dismissUnlessPinned()
         switch session.source {
         case .claude:
             guard session.link.hasPrefix("claude://"), let url = URL(string: session.link) else { return }
@@ -1101,7 +1138,7 @@ final class BoardModel: ObservableObject {
 
     func openApp(_ bundleID: String) {
         guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
-        NotificationCenter.default.post(name: .closeDropdown, object: nil)
+        dismissUnlessPinned()
         NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration())
     }
 }

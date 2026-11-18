@@ -1,6 +1,8 @@
-// The dropdown: a top bar with the source switches and the time range, then
-// one column per shown source (Claude, Codex, Antigravity), then the app's own rows.
+// The dropdown: a top bar with the pin, the source switches and the time range,
+// then one column per shown source (Claude, Codex, Antigravity), then the app's
+// own rows. Also the hover preview card and the gloss-black surface both share.
 
+import AppKit
 import ServiceManagement
 import SwiftUI
 
@@ -78,6 +80,7 @@ struct BoardView: View {
             .padding(.vertical, 4)
         }
         .frame(width: width)
+        .background(ObsidianSurface(cornerRadius: dropdownRadius))
     }
 
     private var visibleColumns: Int {
@@ -99,10 +102,16 @@ struct TopBar: View {
         VStack(spacing: 10) {
             HStack(alignment: .center) {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Agent Dock").font(.system(size: 14, weight: .semibold))
+                    HStack(spacing: 8) {
+                        Text("Agent Dock").font(.system(size: 14, weight: .semibold))
+                        if model.isPinned {
+                            Text("已常驻 · 按住顶栏空白处可拖动").font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                    }
                     Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 12)
+                PinToggle(isOn: $model.isPinned)
                 SourceToggle(name: "Claude", isOn: $model.showClaude)
                 SourceToggle(name: "Codex", isOn: $model.showCodex)
                 SourceToggle(name: "Antigravity", isOn: $model.showAntigravity)
@@ -118,6 +127,10 @@ struct TopBar: View {
         .padding(.horizontal, edge)
         .padding(.top, 12)
         .padding(.bottom, 10)
+        // Pinned, the top bar is a handle for moving the dropdown.
+        .background {
+            if model.isPinned { WindowDragArea() }
+        }
     }
 
     private var subtitle: String {
@@ -142,12 +155,39 @@ struct SourceToggle: View {
             .foregroundStyle(isOn ? Color.primary : Color.secondary)
             .padding(.horizontal, 9)
             .padding(.vertical, 3)
-            .background(Capsule().fill(isOn ? Color.primary.opacity(0.12) : Color.clear))
+            .background(Capsule().fill(LinearGradient(
+                colors: isOn ? [.white.opacity(0.14), .white.opacity(0.08)] : [.clear, .clear],
+                startPoint: .top, endPoint: .bottom)))
             .overlay(Capsule().strokeBorder(Color.primary.opacity(isOn ? 0 : 0.2)))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .help(isOn ? "隐藏 \(name)" : "显示 \(name)")
+    }
+}
+
+// Pins the dropdown: it then stays up when another app comes forward or a row
+// opens something, and the top bar drags it. White when on, no tint.
+struct PinToggle: View {
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button { isOn.toggle() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: isOn ? "pin.fill" : "pin").font(.system(size: 10, weight: .semibold))
+                Text(isOn ? "常驻中" : "常驻").font(.system(size: 11.5, weight: .medium))
+            }
+            .foregroundStyle(isOn ? Color.white : Color.secondary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(LinearGradient(
+                colors: isOn ? [.white.opacity(0.22), .white.opacity(0.12)] : [.clear, .clear],
+                startPoint: .top, endPoint: .bottom)))
+            .overlay(Capsule().strokeBorder(Color.white.opacity(isOn ? 0.34 : 0.18)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(isOn ? "取消常驻：点别处时自动收起" : "常驻：切换应用、打开会话时不收起，可拖动")
     }
 }
 
@@ -342,7 +382,9 @@ struct ProjectSection: View {
         VStack(alignment: .leading, spacing: 0) {
             SectionTitle(text: group.name)
             ForEach(shown) { session in
-                SessionRow(session: session, now: model.now) { model.open(session) }
+                SessionRow(session: session, now: model.now,
+                           open: { model.open(session) },
+                           hover: { inside, frame in model.hoverSession(session, inside: inside, frame: frame) })
             }
             if hidden > 0 {
                 FoldRow(label: "see more ▾") { expanded.insert(group.id) }
@@ -357,9 +399,11 @@ struct SessionRow: View {
     let session: Session
     let now: Date
     let open: () -> Void
+    // The pointer entered or left the row, with the row's frame on screen.
+    let hover: (Bool, NSRect) -> Void
 
     var body: some View {
-        HoverRow(action: open) {
+        HoverRow(action: open, onHover: hover) {
             HStack(spacing: 8) {
                 Marker(state: session.state)
                 Text(session.title)
@@ -374,7 +418,6 @@ struct SessionRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .help(session.title)
     }
 }
 
@@ -512,8 +555,11 @@ struct SectionTitle: View {
 }
 
 // A full-width row that highlights under the pointer, as a menu item does.
+// Hover comes from an always-active tracking area rather than `.onHover`, so it
+// still works on a pinned dropdown while another app is in front.
 struct HoverRow<Content: View>: View {
     let action: () -> Void
+    var onHover: ((Bool, NSRect) -> Void)? = nil
     @ViewBuilder let content: Content
     @State private var isHovered = false
 
@@ -525,13 +571,18 @@ struct HoverRow<Content: View>: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(isHovered ? Color.primary.opacity(0.07) : Color.clear)
+                        .fill(isHovered ? Color.white.opacity(0.10) : Color.clear)
+                        .overlay(RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.white.opacity(isHovered ? 0.18 : 0), lineWidth: 0.5))
                 )
+                .background(HoverTracker { inside, frame in
+                    isHovered = inside
+                    onHover?(inside, frame)
+                })
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 6)
-        .onHover { isHovered = $0 }
     }
 }
 
@@ -569,5 +620,333 @@ struct LoginItemRow: View {
             note = "设置失败"
         }
         isOn = SMAppService.mainApp.status == .enabled
+    }
+}
+
+// MARK: - Gloss black surface
+
+let dropdownRadius: CGFloat = 14
+let previewRadius: CGFloat = 12
+let previewWidth: CGFloat = 360
+
+// Drawn over the dark blur: a neutral black glaze (equal channels, so nothing
+// behind tints it), a clear-coat lift and diagonal sweep along the top, a thin
+// white rim, and a brighter specular line on the top edge. White only.
+struct ObsidianSurface: View {
+    let cornerRadius: CGFloat
+    // Glaze opacity at the top and the bottom: 80%→86% for the dropdown, denser
+    // for the preview card, which often sits over the dropdown itself.
+    var glaze: (top: Double, bottom: Double) = (0.80, 0.86)
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .circular)
+        ZStack(alignment: .top) {
+            LinearGradient(colors: [Color(white: 0.04, opacity: glaze.top), Color(white: 0.017, opacity: glaze.bottom)],
+                           startPoint: .top, endPoint: .bottom)
+            LinearGradient(stops: [.init(color: .white.opacity(0.07), location: 0),
+                                   .init(color: .white.opacity(0.012), location: 0.45),
+                                   .init(color: .white.opacity(0), location: 1)],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: 90)
+            GeometryReader { geometry in
+                LinearGradient(stops: [.init(color: .white.opacity(0.075), location: 0),
+                                       .init(color: .white.opacity(0.02), location: 0.46),
+                                       .init(color: .white.opacity(0), location: 0.72)],
+                               startPoint: UnitPoint(x: 0, y: 0.35), endPoint: UnitPoint(x: 1, y: 0.65))
+                    .frame(width: geometry.size.width * 0.62, height: 56)
+            }
+        }
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color.white.opacity(0.13), lineWidth: 1))
+        .overlay(alignment: .top) {
+            LinearGradient(colors: [.white.opacity(0), .white.opacity(0.30), .white.opacity(0.30), .white.opacity(0)],
+                           startPoint: .leading, endPoint: .trailing)
+                .frame(height: 1)
+                .padding(.horizontal, cornerRadius)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+// MARK: - AppKit helpers
+
+// Pressing here drags the window (used on the top bar while pinned).
+struct WindowDragArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+    }
+}
+
+// Reports the pointer entering and leaving, with the view's frame on screen.
+// The tracking area is active even while the app is in the background, and
+// the view never takes clicks.
+struct HoverTracker: NSViewRepresentable {
+    let onChange: (Bool, NSRect) -> Void
+
+    func makeNSView(context: Context) -> TrackingView {
+        let view = TrackingView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: TrackingView, context: Context) {
+        nsView.onChange = onChange
+    }
+
+    final class TrackingView: NSView {
+        var onChange: ((Bool, NSRect) -> Void)?
+        private var isInside = false
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            for area in trackingAreas { removeTrackingArea(area) }
+            addTrackingArea(NSTrackingArea(rect: .zero,
+                                           options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                           owner: self))
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func mouseEntered(with event: NSEvent) {
+            isInside = true
+            onChange?(true, screenFrame)
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            isInside = false
+            onChange?(false, screenFrame)
+        }
+
+        // A row scrolled away or removed while under the pointer still counts as left.
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            guard newWindow == nil, isInside else { return }
+            isInside = false
+            let report = onChange
+            DispatchQueue.main.async { report?(false, .zero) }
+        }
+
+        private var screenFrame: NSRect {
+            guard let window else { return .zero }
+            return window.convertToScreen(convert(bounds, to: nil))
+        }
+    }
+}
+
+// MARK: - Hover preview
+
+final class PreviewModel: ObservableObject {
+    @Published var session: Session?
+    @Published var entries: [PreviewEntry] = []
+    @Published var isLoading = false
+    // Fixed for as long as the card is up: 360×420, narrower below a row in a
+    // one-column dropdown, shorter where the screen has less room.
+    @Published var width: CGFloat = previewWidth
+    @Published var height: CGFloat = previewHeight
+}
+
+let previewHeight: CGFloat = 420
+
+// What the session under the pointer has been saying: newest at the bottom,
+// scrolled there; a running session's last thinking reads "思考中".
+struct SessionPreviewView: View {
+    @ObservedObject var model: PreviewModel
+    let onHover: (Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let session = model.session {
+                VStack(alignment: .leading, spacing: 0) {
+                    header(session)
+                    Divider().padding(.horizontal, 14)
+                    stream(session)
+                }
+                // Another session fades across instead of snapping.
+                .id(session.id)
+                .transition(.opacity)
+            }
+        }
+        // The card's size is the window's: content scrolls, it never resizes.
+        .frame(width: model.width, height: model.height, alignment: .top)
+        .background(ObsidianSurface(cornerRadius: previewRadius, glaze: (0.90, 0.94)))
+        .clipShape(RoundedRectangle(cornerRadius: previewRadius, style: .circular))
+        .background(HoverTracker { inside, _ in onHover(inside) })
+    }
+
+    private func header(_ session: Session) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 7) {
+                Marker(state: session.state)
+                Text(session.title)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Text(subtitle(session))
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+    }
+
+    private func subtitle(_ session: Session) -> String {
+        let source: String
+        switch session.source {
+        case .claude: source = "Claude"
+        case .codex: source = "Codex"
+        case .antigravity: source = "Antigravity"
+        }
+        let state = session.isRunning ? "运行中，每 1.5 秒刷新" : ago(session.lastActivity, now: Date())
+        return "\(source) · \(session.project) · \(state)"
+    }
+
+    @ViewBuilder
+    private func stream(_ session: Session) -> some View {
+        if model.entries.isEmpty {
+            Text(model.isLoading ? "读取中…" : "没有可预览的消息")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 9) {
+                        ForEach(model.entries) { entry in
+                            PreviewEntryView(entry: entry,
+                                             isLive: session.isRunning && entry.id == model.entries.last?.id,
+                                             width: model.width - 28)
+                        }
+                        Color.clear.frame(height: 1).id("end")
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onAppear { DispatchQueue.main.async { proxy.scrollTo("end", anchor: .bottom) } }
+                // Only a new last step scrolls down, so reading further up is not interrupted.
+                .onChange(of: model.entries.last?.id) { _ in
+                    withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
+                }
+            }
+        }
+    }
+}
+
+struct PreviewEntryView: View {
+    let entry: PreviewEntry
+    let isLive: Bool
+    // The card's content width.
+    let width: CGFloat
+
+    var body: some View {
+        switch entry.kind {
+        case .user:
+            // A bubble at most the width less 36 pt, holding its own markdown.
+            HStack(spacing: 0) {
+                Spacer(minLength: 36)
+                MarkdownView(entry.text, width: min(width - 36 - 20, bubbleWidth))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.11)))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.white.opacity(0.10)))
+            }
+        case .thinking:
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    if isLive { Spinner() }
+                    Text(isLive ? "思考中" : "思考")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.82))
+                }
+                // Inline styles only: thinking is shown from its end, often mid-structure.
+                Text(inlineMarkdown(entry.text))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.leading, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .leading) {
+                Rectangle().fill(claudeOrange.opacity(0.8)).frame(width: 2)
+            }
+        case .tools(let names):
+            ChipFlow(spacing: 4) {
+                ForEach(Array(names.enumerated()), id: \.offset) { _, name in
+                    Text(name)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.72))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.06)))
+                        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.10)))
+                }
+            }
+        case .reply:
+            MarkdownView(entry.text, width: width)
+        }
+    }
+
+    // A short prompt hugs its text; a long one wraps at the bubble's widest.
+    private var bubbleWidth: CGFloat {
+        let longest = entry.text.components(separatedBy: "\n").map { line in
+            line.reduce(CGFloat(0)) { $0 + ($1.unicodeScalars.first!.value > 0x2E7F ? 12 : 6.6) }
+        }.max() ?? 0
+        return max(24, ceil(longest) + 2)
+    }
+}
+
+// Lays chips out left to right, wrapping to a new line when one does not fit.
+struct ChipFlow: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let rows = arrange(subviews, width: width)
+        let height = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(rows.count - 1, 0))
+        let used = rows.map(\.width).max() ?? 0
+        return CGSize(width: proposal.width ?? used, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(subviews, width: bounds.width) {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+                subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(width: min(size.width, bounds.width), height: size.height))
+                x += min(size.width, bounds.width) + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private func arrange(_ subviews: Subviews, width: CGFloat) -> [(indices: [Int], width: CGFloat, height: CGFloat)] {
+        var rows: [(indices: [Int], width: CGFloat, height: CGFloat)] = []
+        var current: (indices: [Int], width: CGFloat, height: CGFloat) = ([], 0, 0)
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(ProposedViewSize(width: width, height: nil))
+            let itemWidth = min(size.width, width)
+            let needed = current.indices.isEmpty ? itemWidth : current.width + spacing + itemWidth
+            if needed > width, !current.indices.isEmpty {
+                rows.append(current)
+                current = ([index], itemWidth, size.height)
+            } else {
+                current = (current.indices + [index], needed, max(current.height, size.height))
+            }
+        }
+        if !current.indices.isEmpty { rows.append(current) }
+        return rows
     }
 }

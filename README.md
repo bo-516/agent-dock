@@ -15,6 +15,9 @@
 - 菜单栏图标随状态变化：右上角转圈表示有任务在跑，旁边的数字是运行中的数量；实心点表示有未查看的
 - 三栏都显示套餐用量（5 小时、每周等）和精确到分钟的重置时间；Antigravity 按模型组分开（Gemini、Claude / GPT）
 - 下拉面板顶部可以单独隐藏 Claude、Codex 或 Antigravity 任意一栏，选择会被记住
+- 点顶部的「常驻」把面板固定在屏幕上：切换应用、打开会话都不会收起，按住顶栏空白处可以拖到任意位置；再点一次恢复点别处自动收起
+- 鼠标在某条会话上停 0.4 秒，鼠标旁边会弹出预览卡片（尽量落在面板内，放不下时自动换到左边、上下），显示最近的提问、思考过程、工具步骤和回复；回复按 Markdown 显示标题、列表、表格和代码；运行中的会话每 1.5 秒刷新一次
+- 面板是中性黑的毛玻璃，背后的窗口会模糊透出来，不跟随系统浅色模式
 - 登录时自动启动；只在 Claude、Codex（桌面端或 CLI 会话）或 Antigravity 运行时才出现在菜单栏
 
 ### 不计入的会话
@@ -70,6 +73,7 @@ agent-dock/macos/build.sh
 - Codex 的套餐额度通过内置或本机安装的 `codex app-server` 标准 JSON-RPC 接口（`account/rateLimits/read`）按需查询。
 - Antigravity 的对话从它本地的 `~/.gemini/antigravity/conversation_summaries.db` 只读读取，Antigravity 那边不需要安装任何东西。
 - Antigravity 的额度来自它本地语言服务的额度接口（Agent Manager 自己显示额度用的也是它）。AgentDock 每次请求前从该进程的启动参数里读取访问令牌和监听端口，令牌只在内存里使用，不写入任何地方。
+- 悬停预览只在鼠标停在某条会话上时，只读读取这一条会话的本地记录：Claude 读 `~/.claude/projects/*/<CLI 会话 id>.jsonl`（会话 id 的对应关系来自桌面端的 `claude-code-sessions`）；Codex 读 `~/.codex/thread_history_*.sqlite`，还没写进去的新会话读它的 rollout 文件；Antigravity 读 `~/.gemini/antigravity/brain/<对话 id>/.system_generated/logs/transcript.jsonl`。只读文件末尾一段，不写入任何文件。
 
 ## 已知限制
 
@@ -87,3 +91,4 @@ agent-dock/macos/build.sh
 - `AgentDock --render-icon <目录>` 会把菜单栏图标的四种状态导出成 PNG，方便检查。
 - `AgentDock --print-quota` 会打印读到的 Codex 与 Antigravity 额度后退出。
 - `AgentDock --print-conversations` 会打印读到的 Codex 与 Antigravity 对话（以及读取失败的原因）后退出。
+- `AgentDock --print-preview` 会取三个来源各自最近的一条会话，打印悬停预览读到的内容后退出。
